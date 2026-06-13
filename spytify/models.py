@@ -49,6 +49,7 @@ class Playlist:
     song_ids: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
+    cover_image: str | None = None  # Base64 encoded cover image from first song
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Playlist":
@@ -60,7 +61,9 @@ class Playlist:
             song_ids=song_ids,
             created_at=str(payload.get("created_at") or utc_now_iso()),
             updated_at=str(payload.get("updated_at") or utc_now_iso()),
+            cover_image=payload.get("cover_image"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        return result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -13,6 +14,9 @@ from .models import DEFAULT_PLAYLIST_ID, Playlist, Song, utc_now_iso
 
 LIBRARY_VERSION = 1
 PLAYLIST_VERSION = 1
+
+# Compression level for embedded audio (6 = balanced, 1 = fastest, 9 = best compression)
+PLAYLIST_AUDIO_COMPRESSION = 6
 
 
 def default_data_dir() -> Path:
@@ -149,16 +153,117 @@ class LibraryStore:
     def playlist_path(self, playlist_id: str) -> Path:
         return self.playlists_dir / f"{playlist_id}.spyt"
 
-    def save_playlist(self, playlist: Playlist) -> None:
+    def save_playlist(self, playlist: Playlist, embed_songs: bool = True) -> None:
         payload = {
             "version": PLAYLIST_VERSION,
             "playlist": playlist.to_dict(),
         }
         path = self.playlist_path(playlist.id)
         temp_path = path.with_suffix(".tmp")
-        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        
+        # Extract cover from first song if playlist has no cover yet
+        if not playlist.cover_image and playlist.song_ids:
+            first_song = self.songs.get(playlist.song_ids[0])
+            if first_song:
+                song_path = self.song_path(first_song)
+                if song_path.exists():
+                    cover = self._extract_cover_image(song_path)
+                    if cover:
+                        playlist.cover_image = cover
+        
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=PLAYLIST_AUDIO_COMPRESSION) as archive:
             archive.writestr("playlist.json", json.dumps(payload, indent=2))
+            
+            # Embed songs in the zip for offline playback
+            if embed_songs:
+                for song_id in playlist.song_ids:
+                    song = self.songs.get(song_id)
+                    if song:
+                        song_path = self.song_path(song)
+                        if song_path.exists():
+                            archive.write(song_path, f"songs/{song_id}.flac")
+        
         temp_path.replace(path)
+
+    def _extract_cover_image(self, audio_path: Path) -> str | None:
+        """Extract cover image from audio file and return as base64 string."""
+        try:
+            from mutagen import File as MutagenFile
+        except Exception:
+            return None
+        
+        try:
+            audio = MutagenFile(str(audio_path))
+            if audio is None or not audio.tags:
+                return None
+            
+            # Try to find album art (cover)
+            for key in ['APIC:', 'cover', 'albumart']:
+                try:
+                    picture = audio.tags.get(key)
+                    if picture:
+                        # For Mutagen's Picture type
+                        if hasattr(picture, 'data'):
+                            return base64.b64encode(picture.data).decode('ascii')
+                        # For CoverImage or other types
+                        elif hasattr(picture, 'value') and isinstance(picture.value, bytes):
+                            return base64.b64encode(picture.value).decode('ascii')
+                except (KeyError, AttributeError, TypeError):
+                    continue
+            
+            # Try generic approach
+            for tag in audio.tags.values():
+                if hasattr(tag, 'data') and isinstance(tag.data, bytes):
+                    mime = getattr(tag, 'mime', 'image/jpeg')
+                    if mime.startswith('image/'):
+                        return base64.b64encode(tag.data).decode('ascii')
+        except Exception:
+            pass
+        
+        return None
+
+    def get_playlist_song_path(self, playlist_id: str, song_id: str) -> Path | None:
+        """Get the path to a song, checking embedded playlist first, then library."""
+        playlist = self.playlists.get(playlist_id)
+        if playlist is None:
+            return None
+        
+        # First check if song is embedded in the playlist zip
+        playlist_zip_path = self.playlist_path(playlist_id)
+        if playlist_zip_path.exists():
+            try:
+                with zipfile.ZipFile(playlist_zip_path, "r") as archive:
+                    embedded_path = f"songs/{song_id}.flac"
+                    if embedded_path in archive.namelist():
+                        # Extract to temp for playback
+                        temp_dir = self.playlists_dir / ".temp"
+                        temp_dir.mkdir(exist_ok=True)
+                        temp_path = temp_dir / f"{song_id}.flac"
+                        
+                        # Check if already extracted and not older than source
+                        source_path = self.song_path(self.songs.get(song_id, Song("", "", "", "", "", "", 0.0)))
+                        if not temp_path.exists() or (source_path.exists() and temp_path.stat().st_mtime < source_path.stat().st_mtime):
+                            with archive.open(embedded_path) as src, open(temp_path, 'wb') as dst:
+                                dst.write(src.read())
+                        return temp_path
+            except (zipfile.BadZipFile, KeyError, OSError):
+                pass
+        
+        # Fall back to library path
+        song = self.songs.get(song_id)
+        if song:
+            path = self.song_path(song)
+            if path.exists():
+                return path
+        
+        return None
+    
+    def clear_temp_files(self) -> None:
+        """Clean up temporary extracted files."""
+        temp_dir = self.playlists_dir / ".temp"
+        if temp_dir.exists():
+            import shutil
+            shutil.rmtree(temp_dir)
 
     def import_music_file(self, source: Path) -> tuple[Song, bool]:
         source = source.expanduser().resolve()
