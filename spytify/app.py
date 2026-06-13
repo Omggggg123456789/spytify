@@ -397,7 +397,7 @@ class MainWindow(QMainWindow):
         
         # Numpad keybindings
         pause_action = QAction(self)
-        pause_action.setShortcut(QKeySequence(Qt.Key.Key_Numlock, Qt.Key.Key_5))
+        pause_action.setShortcut(QKeySequence(Qt.Key.Key_NumLock, Qt.Key.Key_5))
         pause_action.setEnabled(False)  # Disabled to avoid conflict with numlock
         # Use a workaround for numpad - check in keyPressEvent
         
