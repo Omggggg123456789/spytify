@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
+import random
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QPixmap, QIcon
+from PySide6.QtGui import QAction, QKeySequence, QPixmap, QIcon, QGuiApplication
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -123,6 +125,12 @@ class MainWindow(QMainWindow):
         self.last_prev_press_time: float = 0
         self.PREV_THRESHOLD_SECONDS: float = 3.0  # Go to previous if pressed within 3 seconds
         
+        # Shuffle system
+        self.shuffle_enabled: bool = False
+        self.shuffle_order: list[int] = []  # Stores shuffled indices
+        self.shuffle_position: int = -1
+        self.last_played_indices: list[int] = []  # Track last 3 played for shuffle constraint
+        
         # Fade settings (in seconds)
         self.fade_in_duration: float = 0.0
         self.fade_out_duration: float = 0.0
@@ -131,6 +139,9 @@ class MainWindow(QMainWindow):
         
         # System tray
         self.tray_icon: QSystemTrayIcon | None = None
+        
+        # Search
+        self.search_query: str = ""
         
         # Player setup
         self.player = QMediaPlayer(self)
@@ -149,6 +160,7 @@ class MainWindow(QMainWindow):
         self.build_tray()
         self.bind_player()
         self.install_shortcuts()
+        self.install_global_shortcuts()
         self.refresh_all()
         
         # Auto-save temp files on exit
@@ -245,6 +257,10 @@ class MainWindow(QMainWindow):
         self.import_button.setObjectName("PrimaryButton")
         self.import_button.clicked.connect(self.import_music)
         sidebar_layout.addWidget(self.import_button)
+        
+        self.import_folder_button = QPushButton("Import Folder")
+        self.import_folder_button.clicked.connect(self.import_folder)
+        sidebar_layout.addWidget(self.import_folder_button)
 
         self.new_playlist_button = QPushButton("New Playlist")
         self.new_playlist_button.clicked.connect(self.create_playlist)
@@ -316,6 +332,12 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.add_existing_button)
         action_row.addWidget(self.remove_button)
         header_layout.addLayout(action_row, 0, 1, 2, 1)
+        
+        # Search bar
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search songs...")
+        self.search_input.textChanged.connect(self.on_search_changed)
+        header_layout.addWidget(self.search_input, 2, 0, 1, 2)
 
         self.song_table = QTableWidget(0, 4)
         self.song_table.setHorizontalHeaderLabels(["Title", "Artist", "Album", "Time"])
@@ -352,10 +374,15 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self.toggle_playback)
         self.next_button = QPushButton("Next")
         self.next_button.clicked.connect(self.play_next)
+        self.shuffle_button = QPushButton("Shuffle")
+        self.shuffle_button.setCheckable(True)
+        self.shuffle_button.setObjectName("ShuffleButton")
+        self.shuffle_button.clicked.connect(self.toggle_shuffle)
         controls = QHBoxLayout()
         controls.addWidget(self.previous_button)
         controls.addWidget(self.play_button)
         controls.addWidget(self.next_button)
+        controls.addWidget(self.shuffle_button)
         player_layout.addLayout(controls, 0, 1)
 
         self.position_label = QLabel("0:00")
@@ -395,12 +422,6 @@ class MainWindow(QMainWindow):
         play_action.triggered.connect(self.toggle_playback)
         self.addAction(play_action)
         
-        # Numpad keybindings
-        pause_action = QAction(self)
-        pause_action.setShortcut(QKeySequence(Qt.Key.Key_Numlock, Qt.Key.Key_5))
-        pause_action.setEnabled(False)  # Disabled to avoid conflict with numlock
-        # Use a workaround for numpad - check in keyPressEvent
-        
         prev_action = QAction(self)
         prev_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
         prev_action.triggered.connect(self.play_previous)
@@ -411,34 +432,44 @@ class MainWindow(QMainWindow):
         next_action.triggered.connect(self.play_next)
         self.addAction(next_action)
 
-    def keyPressEvent(self, event) -> None:
-        """Handle keyboard shortcuts including numpad."""
-        from PySide6.QtGui import QKeyEvent
+    def install_global_shortcuts(self) -> None:
+        """Install global keyboard shortcuts that work even when window is not focused."""
+        # Install an event filter on the application to capture all key events
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Handle global keyboard events for numpad shortcuts."""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            modifiers = event.modifiers()
+            
+            # Numpad 5 - Play/Pause (with NumLock off or on)
+            if key == Qt.Key.Key_5 and (modifiers & Qt.KeyboardModifier.KeypadModifier):
+                self.toggle_playback()
+                return True
+            
+            # Numpad 4 - Previous
+            if key == Qt.Key.Key_4 and (modifiers & Qt.KeyboardModifier.KeypadModifier):
+                self.play_previous()
+                return True
+            
+            # Numpad 6 - Next
+            if key == Qt.Key.Key_6 and (modifiers & Qt.KeyboardModifier.KeypadModifier):
+                self.play_next()
+                return True
+            
+            # Numpad 8 - Toggle Shuffle
+            if key == Qt.Key.Key_8 and (modifiers & Qt.KeyboardModifier.KeypadModifier):
+                self.toggle_shuffle()
+                return True
+            
+            # Delete key - Remove selected songs from playlist
+            if key == Qt.Key.Key_Delete:
+                self.remove_selected_songs()
+                return True
         
-        key = event.key()
-        modifiers = event.modifiers()
-        
-        # Numpad 5 - Play/Pause
-        if key == Qt.Key.Key_5 and modifiers == Qt.KeyboardModifier.KeypadModifier:
-            self.toggle_playback()
-            return
-        
-        # Numpad 4 - Previous
-        if key == Qt.Key.Key_4 and modifiers == Qt.KeyboardModifier.KeypadModifier:
-            self.play_previous()
-            return
-        
-        # Numpad 6 - Next
-        if key == Qt.Key.Key_6 and modifiers == Qt.KeyboardModifier.KeypadModifier:
-            self.play_next()
-            return
-        
-        # Delete key - Remove selected songs from playlist
-        if key == Qt.Key.Key_Delete:
-            self.remove_selected_songs()
-            return
-        
-        super().keyPressEvent(event)
+        return super().eventFilter(obj, event)
 
     def refresh_all(self) -> None:
         self.refresh_playlist_tiles()
@@ -504,6 +535,18 @@ class MainWindow(QMainWindow):
             name = playlist.name
             song_ids = [song_id for song_id in playlist.song_ids if song_id in self.store.songs]
 
+        # Apply search filter
+        if self.search_query:
+            query = self.search_query.lower()
+            filtered_ids = []
+            for song_id in song_ids:
+                song = self.store.songs.get(song_id)
+                if song:
+                    haystack = f"{song.title} {song.artist} {song.album}".lower()
+                    if query in haystack:
+                        filtered_ids.append(song_id)
+            song_ids = filtered_ids
+
         self.displayed_song_ids = song_ids
         self.playlist_name_input.blockSignals(True)
         self.playlist_name_input.setText(name)
@@ -512,8 +555,21 @@ class MainWindow(QMainWindow):
         self.add_existing_button.setEnabled(not is_default and bool(self.store.songs))
         self.remove_button.setEnabled(not is_default)
 
-        self.playlist_meta_label.setText(f"{len(song_ids)} songs")
+        # Update meta label with search info
+        if self.search_query:
+            self.playlist_meta_label.setText(f"{len(song_ids)} songs (filtered)")
+        else:
+            self.playlist_meta_label.setText(f"{len(song_ids)} songs")
         self.populate_song_table(song_ids)
+        
+        # Regenerate shuffle order if needed
+        if self.shuffle_enabled and len(self.displayed_song_ids) > 0:
+            self._generate_shuffle_order()
+
+    def on_search_changed(self, text: str) -> None:
+        """Handle search text changes."""
+        self.search_query = text
+        self.refresh_playlist_view()
 
     def populate_song_table(self, song_ids: list[str]) -> None:
         self.song_table.setRowCount(0)
@@ -611,6 +667,58 @@ class MainWindow(QMainWindow):
                 errors.append(f"{Path(file_name).name}: {exc}")
 
         progress.setValue(len(files))
+
+        if self.current_playlist_id != DEFAULT_PLAYLIST_ID and imported_ids:
+            self.store.add_songs_to_playlist(self.current_playlist_id, imported_ids)
+
+        self.refresh_all()
+        self.show_import_result(imported_ids, skipped, errors)
+
+    def import_folder(self) -> None:
+        """Import all audio files recursively from a selected folder."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder to import",
+            str(Path.home()),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not folder:
+            return
+        
+        # Recursively find all audio files
+        audio_files = []
+        for root, dirs, files in os.walk(folder):
+            for file in files:
+                if Path(file).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                    audio_files.append(str(Path(root) / file))
+        
+        if not audio_files:
+            QMessageBox.information(self, "Import Folder", "No audio files found in the selected folder.")
+            return
+        
+        progress = QProgressDialog("Importing and converting music...", "Cancel", 0, len(audio_files), self)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+
+        imported_ids: list[str] = []
+        skipped = 0
+        errors: list[str] = []
+
+        for index, file_name in enumerate(audio_files, start=1):
+            progress.setValue(index - 1)
+            progress.setLabelText(f"Importing {Path(file_name).name}")
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                break
+            try:
+                song, created = self.store.import_music_file(Path(file_name))
+                imported_ids.append(song.id)
+                if not created:
+                    skipped += 1
+            except Exception as exc:
+                errors.append(f"{Path(file_name).name}: {exc}")
+
+        progress.setValue(len(audio_files))
 
         if self.current_playlist_id != DEFAULT_PLAYLIST_ID and imported_ids:
             self.store.add_songs_to_playlist(self.current_playlist_id, imported_ids)
@@ -770,8 +878,67 @@ class MainWindow(QMainWindow):
         if self.current_song_index < 0:
             self.play_song(self.displayed_song_ids[0])
             return
-        next_index = (self.current_song_index + 1) % len(self.displayed_song_ids)
-        self.play_song(self.displayed_song_ids[next_index])
+        
+        if self.shuffle_enabled:
+            # Get next index from shuffle order
+            self.shuffle_position += 1
+            if self.shuffle_position >= len(self.shuffle_order):
+                self._generate_shuffle_order()
+                self.shuffle_position = 0
+            
+            # Track for the "not same as playlist order" constraint
+            actual_index = self.shuffle_order[self.shuffle_position]
+            self.last_played_indices.append(actual_index)
+            if len(self.last_played_indices) > 3:
+                self.last_played_indices.pop(0)
+            
+            self.play_song(self.displayed_song_ids[actual_index])
+        else:
+            next_index = (self.current_song_index + 1) % len(self.displayed_song_ids)
+            self.play_song(self.displayed_song_ids[next_index])
+
+    def toggle_shuffle(self) -> None:
+        """Toggle shuffle mode on/off."""
+        self.shuffle_enabled = not self.shuffle_enabled
+        self.shuffle_button.setChecked(self.shuffle_enabled)
+        
+        if self.shuffle_enabled and len(self.displayed_song_ids) > 0:
+            self._generate_shuffle_order()
+            self.shuffle_position = -1  # Will be incremented to 0 on next play_next
+            self.last_played_indices = []
+        else:
+            self.shuffle_order = []
+            self.shuffle_position = -1
+
+    def _generate_shuffle_order(self) -> None:
+        """Generate a shuffled order that doesn't match the original and avoids 3-in-a-row matches."""
+        n = len(self.displayed_song_ids)
+        if n <= 1:
+            self.shuffle_order = list(range(n))
+            return
+        
+        # Create a shuffled order ensuring no 3 consecutive songs match original order
+        indices = list(range(n))
+        
+        # Keep generating until we get a valid shuffle
+        max_attempts = 1000
+        for _ in range(max_attempts):
+            random.shuffle(indices)
+            
+            # Check constraint: no 3 consecutive songs should match original order
+            valid = True
+            for i in range(n - 2):
+                # Check if we have 3 consecutive indices in original order
+                if indices[i] + 1 == indices[i + 1] and indices[i + 1] + 1 == indices[i + 2]:
+                    valid = False
+                    break
+            
+            if valid:
+                self.shuffle_order = indices
+                return
+        
+        # Fallback: just use regular shuffle if we can't find a good one
+        self.shuffle_order = indices
 
     def play_previous(self) -> None:
         if not self.displayed_song_ids:
@@ -1216,6 +1383,19 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
 
 QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
     background: #3d4a5c;
+}
+
+QPushButton#ShuffleButton {
+    min-width: 80px;
+}
+
+QPushButton#ShuffleButton:checked {
+    background: #1ed760;
+    color: #06120a;
+}
+
+QPushButton#ShuffleButton:checked:hover {
+    background: #35e170;
 }
 """
 
